@@ -15,10 +15,17 @@
             sessionStarted: false,
             sessionStartError: null,
             frameDetected: false,
+            frameSource: 'none',
             cameraFeedLikelyMissing: false,
             hitTestSourceCreated: false,
             hitTestErrors: [],
-            reticleVisible: false
+            reticleVisible: false,
+            rendererReady: false,
+            rendererSessionAvailable: false,
+            referenceSpaceType: null,
+            lastFrameMode: null,
+            framePollAttempts: 0,
+            noFramesWarning: false
         };
 
         function setStatus(message) {
@@ -39,10 +46,17 @@
                 ['navigator.xr', diagnostics.xrAvailable ? 'Available' : 'Missing'],
                 ['immersive-ar support', diagnostics.immersiveArSupported === null ? 'Checking...' : (diagnostics.immersiveArSupported ? 'Supported' : 'Not supported')],
                 ['inline support', diagnostics.inlineSupported === null ? 'Checking...' : (diagnostics.inlineSupported ? 'Supported' : 'Not supported')],
+                ['Renderer ready', diagnostics.rendererReady ? 'Yes' : 'No'],
+                ['Renderer session available', diagnostics.rendererSessionAvailable ? 'Yes' : 'No'],
                 ['XR session started', diagnostics.sessionStarted ? 'Yes' : 'No'],
+                ['Reference space', diagnostics.referenceSpaceType || 'Unknown'],
                 ['Hit test source', diagnostics.hitTestSourceCreated ? 'Ready' : 'Not ready'],
                 ['XR frame seen', diagnostics.frameDetected ? 'Yes' : 'No'],
+                ['Frame source', diagnostics.frameSource],
+                ['Last frame mode', diagnostics.lastFrameMode || 'Unknown'],
+                ['Frame poll attempts', String(diagnostics.framePollAttempts)],
                 ['Reticle visible', diagnostics.reticleVisible ? 'Yes' : 'No'],
+                ['No-frames warning', diagnostics.noFramesWarning ? 'Yes' : 'No'],
                 ['Camera passthrough', diagnostics.cameraFeedLikelyMissing ? 'Possibly missing' : 'Unknown / OK']
             ];
 
@@ -66,6 +80,58 @@
             const isIPhone = /iPhone|iPad|iPod/i.test(ua);
             const isAndroid = /Android/i.test(ua);
             return { isIPhone, isAndroid, ua };
+        }
+
+        function getXRSession(sceneEl) {
+            if (!sceneEl) {
+                return null;
+            }
+
+            const renderer = sceneEl.renderer;
+            const xrManager = renderer && renderer.xr;
+            if (xrManager && typeof xrManager.getSession === 'function') {
+                const session = xrManager.getSession();
+                diagnostics.rendererSessionAvailable = !!session;
+                if (session) {
+                    return session;
+                }
+            }
+
+            const fallbackSession = sceneEl.xrSession || null;
+            diagnostics.rendererSessionAvailable = !!fallbackSession;
+            return fallbackSession;
+        }
+
+        function getXRFrame(sceneEl) {
+            if (!sceneEl) {
+                return null;
+            }
+
+            const renderer = sceneEl.renderer;
+            const xrManager = renderer && renderer.xr;
+
+            if (xrManager && xrManager.isPresenting) {
+                if (xrManager.getFrame && typeof xrManager.getFrame === 'function') {
+                    const frame = xrManager.getFrame();
+                    if (frame) {
+                        diagnostics.frameSource = 'renderer.xr.getFrame()';
+                        return frame;
+                    }
+                }
+
+                if (xrManager.frame) {
+                    diagnostics.frameSource = 'renderer.xr.frame';
+                    return xrManager.frame;
+                }
+            }
+
+            if (sceneEl.frame) {
+                diagnostics.frameSource = 'sceneEl.frame';
+                return sceneEl.frame;
+            }
+
+            diagnostics.frameSource = 'none';
+            return null;
         }
 
         async function checkARSupport() {
@@ -139,10 +205,16 @@
                 this.frameCount = 0;
                 this.reticleVisibleFrames = 0;
                 this.passthroughCheckTimeout = null;
+                this.frameWatchInterval = null;
 
                 if (this.model) {
                     this.model.setAttribute('visible', 'false');
                 }
+
+                this.el.sceneEl.addEventListener('renderstart', () => {
+                    diagnostics.rendererReady = true;
+                    setDiagnosticList();
+                });
 
                 if (this.placeButton) {
                     this.placeButton.disabled = true;
@@ -162,15 +234,25 @@
 
                 this.el.sceneEl.addEventListener('enter-vr', async () => {
                     try {
-                        const session = this.el.sceneEl.xrSession;
+                        const sceneEl = this.el.sceneEl;
+                        const session = getXRSession(sceneEl);
                         if (!session) {
-                            throw new Error('No XR session is available.');
+                            throw new Error('No XR session is available from renderer.xr or sceneEl.xrSession.');
                         }
 
                         diagnostics.sessionStarted = true;
                         diagnostics.sessionStartError = null;
+                        diagnostics.noFramesWarning = false;
+
                         this.viewerSpace = await session.requestReferenceSpace('viewer');
-                        this.localSpace = await session.requestReferenceSpace('local');
+
+                        const rendererReferenceSpace = sceneEl.renderer && sceneEl.renderer.xr && typeof sceneEl.renderer.xr.getReferenceSpace === 'function'
+                            ? sceneEl.renderer.xr.getReferenceSpace()
+                            : null;
+
+                        this.localSpace = rendererReferenceSpace || await session.requestReferenceSpace('local');
+                        diagnostics.referenceSpaceType = rendererReferenceSpace ? 'renderer.xr.getReferenceSpace()' : 'session.requestReferenceSpace(local)';
+
                         this.xrHitTestSource = await session.requestHitTestSource({
                             space: this.viewerSpace
                         });
@@ -180,10 +262,29 @@
                         setDiagnosticList();
 
                         clearTimeout(this.passthroughCheckTimeout);
+                        clearInterval(this.frameWatchInterval);
+
+                        this.frameWatchInterval = setInterval(() => {
+                            diagnostics.framePollAttempts += 1;
+                            const polledFrame = getXRFrame(sceneEl);
+                            if (polledFrame) {
+                                diagnostics.frameDetected = true;
+                            }
+                            if (sceneEl.renderer && sceneEl.renderer.xr) {
+                                diagnostics.lastFrameMode = sceneEl.renderer.xr.isPresenting ? 'immersive-presenting' : 'not-presenting';
+                            }
+                            setDiagnosticList();
+                        }, 500);
+
                         this.passthroughCheckTimeout = setTimeout(() => {
-                            if (diagnostics.sessionStarted && diagnostics.frameDetected && !diagnostics.reticleVisible) {
+                            if (diagnostics.sessionStarted && !diagnostics.frameDetected) {
+                                diagnostics.noFramesWarning = true;
                                 diagnostics.cameraFeedLikelyMissing = true;
-                                setStatus('AR session is running, but no surface was detected. If you only see black, camera passthrough may not be working on this device/browser.');
+                                setStatus('AR session started, but no XR frames were received. This usually indicates a browser/device compatibility problem or an A-Frame WebXR integration issue.');
+                                setDiagnosticList();
+                            } else if (diagnostics.sessionStarted && diagnostics.frameDetected && !diagnostics.reticleVisible) {
+                                diagnostics.cameraFeedLikelyMissing = true;
+                                setStatus('AR frames are arriving, but no surface was detected. If you only see black, camera passthrough may not be working on this device/browser.');
                                 setDiagnosticList();
                             }
                         }, 5000);
@@ -209,12 +310,19 @@
                     this.frameCount = 0;
                     this.reticleVisibleFrames = 0;
                     clearTimeout(this.passthroughCheckTimeout);
+                    clearInterval(this.frameWatchInterval);
 
                     diagnostics.sessionStarted = false;
                     diagnostics.frameDetected = false;
+                    diagnostics.frameSource = 'none';
                     diagnostics.hitTestSourceCreated = false;
                     diagnostics.reticleVisible = false;
                     diagnostics.cameraFeedLikelyMissing = false;
+                    diagnostics.rendererSessionAvailable = false;
+                    diagnostics.referenceSpaceType = null;
+                    diagnostics.lastFrameMode = null;
+                    diagnostics.framePollAttempts = 0;
+                    diagnostics.noFramesWarning = false;
 
                     if (this.reticle) {
                         this.reticle.setAttribute('visible', 'false');
@@ -234,13 +342,16 @@
             },
             tick: function () {
                 try {
-                    const frame = this.el.sceneEl.frame;
+                    const frame = getXRFrame(this.el.sceneEl);
                     if (!frame || !this.xrHitTestSource || !this.localSpace || !this.reticle) {
                         return;
                     }
 
                     this.frameCount += 1;
                     diagnostics.frameDetected = true;
+                    if (this.el.sceneEl.renderer && this.el.sceneEl.renderer.xr) {
+                        diagnostics.lastFrameMode = this.el.sceneEl.renderer.xr.isPresenting ? 'immersive-presenting' : 'not-presenting';
+                    }
 
                     const hitTestResults = frame.getHitTestResults(this.xrHitTestSource);
                     if (hitTestResults.length > 0) {
@@ -261,6 +372,7 @@
                         this.reticleVisibleFrames += 1;
                         diagnostics.reticleVisible = true;
                         diagnostics.cameraFeedLikelyMissing = false;
+                        diagnostics.noFramesWarning = false;
 
                         if (!this.surfaceFound) {
                             this.surfaceFound = true;
