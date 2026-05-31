@@ -6,40 +6,124 @@
     <title>FSDK WebXR Markerless Environmental Placement Mockup</title>
     <script src="https://aframe.io/releases/1.4.0/aframe.min.js"></script>
     <script>
-        async function checkARSupport() {
-            const status = document.getElementById('status-message');
-            const enterArButton = document.getElementById('enter-ar-button');
+        const diagnostics = {
+            secureContext: window.isSecureContext,
+            userAgent: navigator.userAgent,
+            xrAvailable: !!navigator.xr,
+            immersiveArSupported: null,
+            inlineSupported: null,
+            sessionStarted: false,
+            sessionStartError: null,
+            frameDetected: false,
+            cameraFeedLikelyMissing: false,
+            hitTestSourceCreated: false,
+            hitTestErrors: [],
+            reticleVisible: false
+        };
 
-            if (!status || !enterArButton) {
+        function setStatus(message) {
+            const status = document.getElementById('status-message');
+            if (status) {
+                status.textContent = message;
+            }
+        }
+
+        function setDiagnosticList() {
+            const diagnosticList = document.getElementById('diagnostic-list');
+            if (!diagnosticList) {
                 return;
             }
 
+            const entries = [
+                ['Secure context', diagnostics.secureContext ? 'Yes' : 'No'],
+                ['navigator.xr', diagnostics.xrAvailable ? 'Available' : 'Missing'],
+                ['immersive-ar support', diagnostics.immersiveArSupported === null ? 'Checking...' : (diagnostics.immersiveArSupported ? 'Supported' : 'Not supported')],
+                ['inline support', diagnostics.inlineSupported === null ? 'Checking...' : (diagnostics.inlineSupported ? 'Supported' : 'Not supported')],
+                ['XR session started', diagnostics.sessionStarted ? 'Yes' : 'No'],
+                ['Hit test source', diagnostics.hitTestSourceCreated ? 'Ready' : 'Not ready'],
+                ['XR frame seen', diagnostics.frameDetected ? 'Yes' : 'No'],
+                ['Reticle visible', diagnostics.reticleVisible ? 'Yes' : 'No'],
+                ['Camera passthrough', diagnostics.cameraFeedLikelyMissing ? 'Possibly missing' : 'Unknown / OK']
+            ];
+
+            diagnosticList.innerHTML = entries
+                .map(([label, value]) => `<li><strong>${label}:</strong> ${value}</li>`)
+                .join('');
+
+            const errorBox = document.getElementById('error-log');
+            if (errorBox) {
+                const combinedErrors = [];
+                if (diagnostics.sessionStartError) {
+                    combinedErrors.push('Session: ' + diagnostics.sessionStartError);
+                }
+                combinedErrors.push(...diagnostics.hitTestErrors);
+                errorBox.textContent = combinedErrors.length > 0 ? combinedErrors.join('\n') : 'No runtime errors captured yet.';
+            }
+        }
+
+        function detectPlatform() {
+            const ua = navigator.userAgent || '';
+            const isIPhone = /iPhone|iPad|iPod/i.test(ua);
+            const isAndroid = /Android/i.test(ua);
+            return { isIPhone, isAndroid, ua };
+        }
+
+        async function checkARSupport() {
+            const enterArButton = document.getElementById('enter-ar-button');
+            const platformNotice = document.getElementById('platform-notice');
+            const { isIPhone, isAndroid } = detectPlatform();
+
+            if (!enterArButton) {
+                return;
+            }
+
+            if (platformNotice) {
+                if (isIPhone) {
+                    platformNotice.textContent = 'iPhone detected: WebXR AR camera passthrough is often unsupported or unreliable in Safari, even when camera permission is granted.';
+                } else if (isAndroid) {
+                    platformNotice.textContent = 'Android detected: for best results use Chrome on an ARCore-supported device.';
+                } else {
+                    platformNotice.textContent = 'Unknown mobile platform: WebXR AR support may vary.';
+                }
+            }
+
             if (!window.isSecureContext) {
-                status.textContent = 'AR requires HTTPS or localhost.';
+                setStatus('AR requires HTTPS or localhost.');
                 enterArButton.disabled = true;
+                setDiagnosticList();
                 return;
             }
 
             if (!navigator.xr) {
-                status.textContent = 'This browser does not support WebXR.';
+                setStatus('This browser does not support WebXR.');
                 enterArButton.disabled = true;
+                setDiagnosticList();
                 return;
             }
 
             try {
-                const supported = await navigator.xr.isSessionSupported('immersive-ar');
-                if (supported) {
-                    status.textContent = 'Move your phone slowly to detect a surface, then tap Place Model.';
-                    enterArButton.disabled = false;
-                } else {
-                    status.textContent = 'Immersive AR is not supported on this device/browser.';
-                    enterArButton.disabled = true;
-                }
+                diagnostics.immersiveArSupported = await navigator.xr.isSessionSupported('immersive-ar');
             } catch (error) {
-                console.error('AR support check failed:', error);
-                status.textContent = 'Unable to verify AR support: ' + error.message;
+                diagnostics.immersiveArSupported = false;
+                diagnostics.hitTestErrors.push('Support check immersive-ar: ' + error.message);
+            }
+
+            try {
+                diagnostics.inlineSupported = await navigator.xr.isSessionSupported('inline');
+            } catch (error) {
+                diagnostics.inlineSupported = false;
+                diagnostics.hitTestErrors.push('Support check inline: ' + error.message);
+            }
+
+            if (diagnostics.immersiveArSupported) {
+                setStatus('AR appears supported. Tap Start AR, then move your phone slowly and watch diagnostics below.');
+                enterArButton.disabled = false;
+            } else {
+                setStatus('Immersive AR is not supported on this device/browser.');
                 enterArButton.disabled = true;
             }
+
+            setDiagnosticList();
         }
 
         AFRAME.registerComponent('markerless-hit-test', {
@@ -49,10 +133,12 @@
                 this.localSpace = null;
                 this.reticle = document.querySelector('#reticle');
                 this.model = document.querySelector('#educational-model');
-                this.status = document.querySelector('#status-message');
                 this.placeButton = document.querySelector('#place-model-button');
                 this.surfaceFound = false;
                 this.modelPlaced = false;
+                this.frameCount = 0;
+                this.reticleVisibleFrames = 0;
+                this.passthroughCheckTimeout = null;
 
                 if (this.model) {
                     this.model.setAttribute('visible', 'false');
@@ -69,10 +155,8 @@
                         this.model.object3D.quaternion.copy(this.reticle.object3D.quaternion);
                         this.model.setAttribute('visible', 'true');
                         this.modelPlaced = true;
-
-                        if (this.status) {
-                            this.status.textContent = 'Model placed. You can walk around it now.';
-                        }
+                        setStatus('Model placed. If the background is still black, camera passthrough is likely not working on this device/browser.');
+                        setDiagnosticList();
                     });
                 }
 
@@ -83,23 +167,36 @@
                             throw new Error('No XR session is available.');
                         }
 
+                        diagnostics.sessionStarted = true;
+                        diagnostics.sessionStartError = null;
                         this.viewerSpace = await session.requestReferenceSpace('viewer');
                         this.localSpace = await session.requestReferenceSpace('local');
                         this.xrHitTestSource = await session.requestHitTestSource({
                             space: this.viewerSpace
                         });
+                        diagnostics.hitTestSourceCreated = true;
+                        diagnostics.cameraFeedLikelyMissing = false;
+                        setStatus('AR session started. Move your phone to find a surface.');
+                        setDiagnosticList();
 
-                        if (this.status) {
-                            this.status.textContent = 'AR session started. Move your phone to find a surface.';
-                        }
+                        clearTimeout(this.passthroughCheckTimeout);
+                        this.passthroughCheckTimeout = setTimeout(() => {
+                            if (diagnostics.sessionStarted && diagnostics.frameDetected && !diagnostics.reticleVisible) {
+                                diagnostics.cameraFeedLikelyMissing = true;
+                                setStatus('AR session is running, but no surface was detected. If you only see black, camera passthrough may not be working on this device/browser.');
+                                setDiagnosticList();
+                            }
+                        }, 5000);
                     } catch (error) {
+                        diagnostics.sessionStarted = false;
+                        diagnostics.sessionStartError = error.message;
+                        diagnostics.hitTestSourceCreated = false;
                         console.error('AR initialization failed:', error);
-                        if (this.status) {
-                            this.status.textContent = 'AR initialization failed: ' + error.message;
-                        }
+                        setStatus('AR initialization failed: ' + error.message);
                         if (this.placeButton) {
                             this.placeButton.disabled = true;
                         }
+                        setDiagnosticList();
                     }
                 });
 
@@ -109,6 +206,15 @@
                     this.localSpace = null;
                     this.surfaceFound = false;
                     this.modelPlaced = false;
+                    this.frameCount = 0;
+                    this.reticleVisibleFrames = 0;
+                    clearTimeout(this.passthroughCheckTimeout);
+
+                    diagnostics.sessionStarted = false;
+                    diagnostics.frameDetected = false;
+                    diagnostics.hitTestSourceCreated = false;
+                    diagnostics.reticleVisible = false;
+                    diagnostics.cameraFeedLikelyMissing = false;
 
                     if (this.reticle) {
                         this.reticle.setAttribute('visible', 'false');
@@ -122,9 +228,8 @@
                         this.placeButton.disabled = true;
                     }
 
-                    if (this.status) {
-                        this.status.textContent = 'AR session ended.';
-                    }
+                    setStatus('AR session ended.');
+                    setDiagnosticList();
                 });
             },
             tick: function () {
@@ -133,6 +238,9 @@
                     if (!frame || !this.xrHitTestSource || !this.localSpace || !this.reticle) {
                         return;
                     }
+
+                    this.frameCount += 1;
+                    diagnostics.frameDetected = true;
 
                     const hitTestResults = frame.getHitTestResults(this.xrHitTestSource);
                     if (hitTestResults.length > 0) {
@@ -150,30 +258,37 @@
                             pose.transform.orientation.w
                         );
 
+                        this.reticleVisibleFrames += 1;
+                        diagnostics.reticleVisible = true;
+                        diagnostics.cameraFeedLikelyMissing = false;
+
                         if (!this.surfaceFound) {
                             this.surfaceFound = true;
                             if (this.placeButton) {
                                 this.placeButton.disabled = false;
                             }
-                            if (this.status) {
-                                this.status.textContent = 'Surface found. Tap Place Model.';
-                            }
+                            setStatus('Surface found. Tap Place Model.');
                         }
                     } else {
                         this.reticle.setAttribute('visible', 'false');
+                        diagnostics.reticleVisible = false;
                         this.surfaceFound = false;
                         if (!this.modelPlaced && this.placeButton) {
                             this.placeButton.disabled = true;
                         }
-                        if (!this.modelPlaced && this.status) {
-                            this.status.textContent = 'Scanning for a surface. Move your phone slowly.';
+                        if (!this.modelPlaced) {
+                            setStatus('Scanning for a surface. Move your phone slowly.');
                         }
+                    }
+
+                    if (this.frameCount % 30 === 0) {
+                        setDiagnosticList();
                     }
                 } catch (error) {
                     console.error('Hit test update failed:', error);
-                    if (this.status) {
-                        this.status.textContent = 'Surface detection failed: ' + error.message;
-                    }
+                    diagnostics.hitTestErrors.push('Tick: ' + error.message);
+                    setStatus('Surface detection failed: ' + error.message);
+                    setDiagnosticList();
                 }
             }
         });
@@ -181,26 +296,42 @@
         window.addEventListener('load', () => {
             const enterArButton = document.getElementById('enter-ar-button');
             const scene = document.querySelector('a-scene');
+            const copyButton = document.getElementById('copy-diagnostics-button');
 
             if (enterArButton && scene) {
                 enterArButton.addEventListener('click', async () => {
                     try {
+                        setStatus('Starting AR session...');
+                        setDiagnosticList();
                         await scene.enterAR();
                     } catch (error) {
+                        diagnostics.sessionStartError = error.message;
                         console.error('Failed to enter AR:', error);
-                        const status = document.getElementById('status-message');
-                        if (status) {
-                            status.textContent = 'Failed to enter AR: ' + error.message;
-                        }
+                        setStatus('Failed to enter AR: ' + error.message);
+                        setDiagnosticList();
                     }
                 });
             }
 
+            if (copyButton) {
+                copyButton.addEventListener('click', async () => {
+                    const text = JSON.stringify(diagnostics, null, 2);
+                    try {
+                        await navigator.clipboard.writeText(text);
+                        setStatus('Diagnostics copied. Paste them back here and I can help debug further.');
+                    } catch (error) {
+                        console.error('Failed to copy diagnostics:', error);
+                        setStatus('Could not copy diagnostics automatically. You can still screenshot them.');
+                    }
+                });
+            }
+
+            setDiagnosticList();
             checkARSupport();
         });
     </script>
 </head>
-<body style="margin: 0; overflow: hidden;">
+<body style="margin: 0; overflow: hidden; font-family: Arial, sans-serif;">
     <a-scene
         background="color: #111111"
         renderer="colorManagement: true; physicallyCorrectLights: true"
@@ -221,8 +352,13 @@
     </a-scene>
 
     <div id="ui-container" style="position: absolute; inset: 0; pointer-events: none; z-index: 10;">
-        <div style="position: absolute; top: 20px; left: 50%; transform: translateX(-50%); width: min(90%, 420px); background: rgba(0, 0, 0, 0.7); color: white; padding: 12px 16px; border-radius: 12px; text-align: center; font-family: Arial, sans-serif; pointer-events: auto;">
-            <div id="status-message">Checking AR support...</div>
+        <div style="position: absolute; top: 20px; left: 50%; transform: translateX(-50%); width: min(92%, 520px); background: rgba(0, 0, 0, 0.75); color: white; padding: 14px 16px; border-radius: 12px; text-align: left; pointer-events: auto; box-sizing: border-box;">
+            <div id="status-message" style="font-weight: bold; margin-bottom: 10px;">Checking AR support...</div>
+            <div id="platform-notice" style="font-size: 13px; opacity: 0.9; margin-bottom: 10px;"></div>
+            <div style="font-size: 13px; margin-bottom: 6px;">Diagnostics</div>
+            <ul id="diagnostic-list" style="margin: 0 0 10px 18px; padding: 0; font-size: 13px; line-height: 1.4;"></ul>
+            <div style="font-size: 13px; margin-bottom: 6px;">Captured errors</div>
+            <pre id="error-log" style="margin: 0; white-space: pre-wrap; word-break: break-word; background: rgba(255,255,255,0.08); padding: 10px; border-radius: 8px; font-size: 12px; max-height: 120px; overflow: auto;">No runtime errors captured yet.</pre>
         </div>
 
         <div style="position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%); display: flex; flex-direction: column; gap: 12px; width: min(90%, 320px); pointer-events: auto;">
@@ -231,6 +367,9 @@
             </button>
             <button id="place-model-button" disabled style="padding: 14px 20px; font-size: 16px; background-color: #007bff; color: white; border: none; border-radius: 8px; cursor: pointer;">
                 Place Model
+            </button>
+            <button id="copy-diagnostics-button" style="padding: 12px 20px; font-size: 15px; background-color: #17a2b8; color: white; border: none; border-radius: 8px; cursor: pointer;">
+                Copy Diagnostics
             </button>
             <button onclick="window.location.href='https://forms.gle/FyjmaRiQRxBmEi5o7'" style="padding: 12px 24px; font-size: 16px; background-color: #6c757d; color: white; border: none; border-radius: 8px; cursor: pointer;">
                 Proceed to Topic Assessment
