@@ -6,64 +6,236 @@
     <title>FSDK WebXR Markerless Environmental Placement Mockup</title>
     <script src="https://aframe.io/releases/1.4.0/aframe.min.js"></script>
     <script>
-        // Registering a custom system component to handle environmental placement
+        async function checkARSupport() {
+            const status = document.getElementById('status-message');
+            const enterArButton = document.getElementById('enter-ar-button');
+
+            if (!status || !enterArButton) {
+                return;
+            }
+
+            if (!window.isSecureContext) {
+                status.textContent = 'AR requires HTTPS or localhost.';
+                enterArButton.disabled = true;
+                return;
+            }
+
+            if (!navigator.xr) {
+                status.textContent = 'This browser does not support WebXR.';
+                enterArButton.disabled = true;
+                return;
+            }
+
+            try {
+                const supported = await navigator.xr.isSessionSupported('immersive-ar');
+                if (supported) {
+                    status.textContent = 'Move your phone slowly to detect a surface, then tap Place Model.';
+                    enterArButton.disabled = false;
+                } else {
+                    status.textContent = 'Immersive AR is not supported on this device/browser.';
+                    enterArButton.disabled = true;
+                }
+            } catch (error) {
+                console.error('AR support check failed:', error);
+                status.textContent = 'Unable to verify AR support: ' + error.message;
+                enterArButton.disabled = true;
+            }
+        }
+
         AFRAME.registerComponent('markerless-hit-test', {
             init: function () {
                 this.xrHitTestSource = null;
                 this.viewerSpace = null;
+                this.localSpace = null;
                 this.reticle = document.querySelector('#reticle');
                 this.model = document.querySelector('#educational-model');
-                this.el.sceneEl.addEventListener('enter-vr', () => {
-                    let session = this.el.sceneEl.xrSession;
-                    if (session) {
-                        session.requestReferenceSpace('viewer').then((space) => {
-                            this.viewerSpace = space;
-                            session.requestHitTestSource({ space: this.viewerSpace }).then((source) => {
-                                this.xrHitTestSource = source;
-                            });
+                this.status = document.querySelector('#status-message');
+                this.placeButton = document.querySelector('#place-model-button');
+                this.surfaceFound = false;
+                this.modelPlaced = false;
+
+                if (this.model) {
+                    this.model.setAttribute('visible', 'false');
+                }
+
+                if (this.placeButton) {
+                    this.placeButton.disabled = true;
+                    this.placeButton.addEventListener('click', () => {
+                        if (!this.surfaceFound || !this.reticle || !this.model) {
+                            return;
+                        }
+
+                        this.model.object3D.position.copy(this.reticle.object3D.position);
+                        this.model.object3D.quaternion.copy(this.reticle.object3D.quaternion);
+                        this.model.setAttribute('visible', 'true');
+                        this.modelPlaced = true;
+
+                        if (this.status) {
+                            this.status.textContent = 'Model placed. You can walk around it now.';
+                        }
+                    });
+                }
+
+                this.el.sceneEl.addEventListener('enter-vr', async () => {
+                    try {
+                        const session = this.el.sceneEl.xrSession;
+                        if (!session) {
+                            throw new Error('No XR session is available.');
+                        }
+
+                        this.viewerSpace = await session.requestReferenceSpace('viewer');
+                        this.localSpace = await session.requestReferenceSpace('local');
+                        this.xrHitTestSource = await session.requestHitTestSource({
+                            space: this.viewerSpace
                         });
-                        session.requestReferenceSpace('local').then((space) => {
-                            this.localSpace = space;
-                        });
+
+                        if (this.status) {
+                            this.status.textContent = 'AR session started. Move your phone to find a surface.';
+                        }
+                    } catch (error) {
+                        console.error('AR initialization failed:', error);
+                        if (this.status) {
+                            this.status.textContent = 'AR initialization failed: ' + error.message;
+                        }
+                        if (this.placeButton) {
+                            this.placeButton.disabled = true;
+                        }
+                    }
+                });
+
+                this.el.sceneEl.addEventListener('exit-vr', () => {
+                    this.xrHitTestSource = null;
+                    this.viewerSpace = null;
+                    this.localSpace = null;
+                    this.surfaceFound = false;
+                    this.modelPlaced = false;
+
+                    if (this.reticle) {
+                        this.reticle.setAttribute('visible', 'false');
+                    }
+
+                    if (this.model) {
+                        this.model.setAttribute('visible', 'false');
+                    }
+
+                    if (this.placeButton) {
+                        this.placeButton.disabled = true;
+                    }
+
+                    if (this.status) {
+                        this.status.textContent = 'AR session ended.';
                     }
                 });
             },
             tick: function () {
-                let frame = this.el.sceneEl.frame;
-                if (frame && this.xrHitTestSource && this.localSpace) {
-                    let hitTestResults = frame.getHitTestResults(this.xrHitTestSource);
+                try {
+                    const frame = this.el.sceneEl.frame;
+                    if (!frame || !this.xrHitTestSource || !this.localSpace || !this.reticle) {
+                        return;
+                    }
+
+                    const hitTestResults = frame.getHitTestResults(this.xrHitTestSource);
                     if (hitTestResults.length > 0) {
-                        let pose = hitTestResults[0].getPose(this.localSpace);
+                        const pose = hitTestResults[0].getPose(this.localSpace);
                         this.reticle.setAttribute('visible', 'true');
-                        this.reticle.object3D.position.copy(pose.transform.position);
-                        this.reticle.object3D.quaternion.copy(pose.transform.orientation);
+                        this.reticle.object3D.position.set(
+                            pose.transform.position.x,
+                            pose.transform.position.y,
+                            pose.transform.position.z
+                        );
+                        this.reticle.object3D.quaternion.set(
+                            pose.transform.orientation.x,
+                            pose.transform.orientation.y,
+                            pose.transform.orientation.z,
+                            pose.transform.orientation.w
+                        );
+
+                        if (!this.surfaceFound) {
+                            this.surfaceFound = true;
+                            if (this.placeButton) {
+                                this.placeButton.disabled = false;
+                            }
+                            if (this.status) {
+                                this.status.textContent = 'Surface found. Tap Place Model.';
+                            }
+                        }
                     } else {
                         this.reticle.setAttribute('visible', 'false');
+                        this.surfaceFound = false;
+                        if (!this.modelPlaced && this.placeButton) {
+                            this.placeButton.disabled = true;
+                        }
+                        if (!this.modelPlaced && this.status) {
+                            this.status.textContent = 'Scanning for a surface. Move your phone slowly.';
+                        }
+                    }
+                } catch (error) {
+                    console.error('Hit test update failed:', error);
+                    if (this.status) {
+                        this.status.textContent = 'Surface detection failed: ' + error.message;
                     }
                 }
             }
         });
+
+        window.addEventListener('load', () => {
+            const enterArButton = document.getElementById('enter-ar-button');
+            const scene = document.querySelector('a-scene');
+
+            if (enterArButton && scene) {
+                enterArButton.addEventListener('click', async () => {
+                    try {
+                        await scene.enterAR();
+                    } catch (error) {
+                        console.error('Failed to enter AR:', error);
+                        const status = document.getElementById('status-message');
+                        if (status) {
+                            status.textContent = 'Failed to enter AR: ' + error.message;
+                        }
+                    }
+                });
+            }
+
+            checkARSupport();
+        });
     </script>
 </head>
 <body style="margin: 0; overflow: hidden;">
-    <a-scene webxr="requiredFeatures: hit-test; optionalFeatures: dom-overlay; overlayElement: #ui-container;" markerless-hit-test>
+    <a-scene
+        background="color: #111111"
+        renderer="colorManagement: true; physicallyCorrectLights: true"
+        vr-mode-ui="enabled: false"
+        webxr="requiredFeatures: hit-test; optionalFeatures: dom-overlay; overlayElement: #ui-container;"
+        markerless-hit-test>
         <a-assets>
             <a-asset-item id="database-schema" src="https://cdn.jsdelivr.net/gh/KhronosGroup/glTF-Sample-Models/2.0/StructureFormula/glTF-Binary/StructureFormula.glb"></a-asset-item>
         </a-assets>
-        
+
         <a-entity id="reticle" visible="false">
             <a-ring color="#00FF00" radius-inner="0.1" radius-outer="0.15" rotation="-90 0 0"></a-ring>
         </a-entity>
-        
-        <a-entity id="educational-model" gltf-model="#database-schema" scale="0.2 0.2 0.2" position="0 0 -2"></a-entity>
-        
+
+        <a-entity id="educational-model" gltf-model="#database-schema" scale="0.2 0.2 0.2" visible="false"></a-entity>
+
         <a-entity camera></a-entity>
     </a-scene>
 
-    <div id="ui-container" style="position: absolute; bottom: 20px; width: 100%; text-align: center; z-index: 10;">
-        <button onclick="window.location.href='https://forms.gle/FyjmaRiQRxBmEi5o7'" style="padding: 12px 24px; font-size: 16px; background-color: #007bff; color: white; border: none; border-radius: 5px; cursor: pointer;">
-            Proceed to Topic Assessment
-        </button>
+    <div id="ui-container" style="position: absolute; inset: 0; pointer-events: none; z-index: 10;">
+        <div style="position: absolute; top: 20px; left: 50%; transform: translateX(-50%); width: min(90%, 420px); background: rgba(0, 0, 0, 0.7); color: white; padding: 12px 16px; border-radius: 12px; text-align: center; font-family: Arial, sans-serif; pointer-events: auto;">
+            <div id="status-message">Checking AR support...</div>
+        </div>
+
+        <div style="position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%); display: flex; flex-direction: column; gap: 12px; width: min(90%, 320px); pointer-events: auto;">
+            <button id="enter-ar-button" disabled style="padding: 14px 20px; font-size: 16px; background-color: #28a745; color: white; border: none; border-radius: 8px; cursor: pointer;">
+                Start AR
+            </button>
+            <button id="place-model-button" disabled style="padding: 14px 20px; font-size: 16px; background-color: #007bff; color: white; border: none; border-radius: 8px; cursor: pointer;">
+                Place Model
+            </button>
+            <button onclick="window.location.href='https://forms.gle/FyjmaRiQRxBmEi5o7'" style="padding: 12px 24px; font-size: 16px; background-color: #6c757d; color: white; border: none; border-radius: 8px; cursor: pointer;">
+                Proceed to Topic Assessment
+            </button>
+        </div>
     </div>
 </body>
 </html>
